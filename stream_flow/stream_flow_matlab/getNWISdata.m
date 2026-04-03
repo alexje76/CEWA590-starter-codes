@@ -1,60 +1,73 @@
-% matlab starter code to scrape USGS stream gage data from NWIS server
+% matlab starter code to scrape USGS stream gage data from NWIS API
 %
 % J. Thomson, Apr 2024
+% Updated 2026 - migrated from deprecated NWISWeb to USGS Water Data API
+%   Old URL: waterdata.usgs.gov/nwis/measurements (decommissioned 2025)
+%   New API: api.waterdata.usgs.gov/ogcapi/v0/collections/field-measurements
+%   Requires MATLAB R2017b or later (webread with JSON support)
 
 gageno='12200500'; % Skagit
 %gageno='12061500'; % Skykomish
 
-OUTFILENAME = websave('streamdata.csv',['https://waterdata.usgs.gov/nwis/measurements?site_no=' gageno '&agency_cd=USGS&format=rdb_expanded']);
+site_id = ['USGS-' gageno];
+base_url = 'https://api.waterdata.usgs.gov/ogcapi/v0/collections/field-measurements/items';
+options = weboptions('ContentType', 'json', 'Timeout', 60);
 
+disp(['Fetching field measurements for ' site_id]);
 
-%% read data, dealing with timestamps that may or may not have hh:mm:ss included
+%% Fetch discharge (parameter 00060, ft^3/s) and gage height (00065, ft), first 10k
 
-headerlines = 17;
-linenum = 0;
-counter = 0;
-tline = 0;
+q_resp = webread(base_url, 'monitoring_location_id', site_id, ...
+    'parameter_code', '00060', 'f', 'json', 'limit', 10000, options);
 
-fid = fopen(OUTFILENAME);
+h_resp = webread(base_url, 'monitoring_location_id', site_id, ...
+    'parameter_code', '00065', 'f', 'json', 'limit', 10000, options);
 
-while tline~=-1
-    tline = fgetl(fid);
-    linenum = linenum + 1;
-    if length(tline)>6 && linenum > headerlines
-        counter = counter+1;
-        thisdata = textscan(tline,'%s%s%s%s%s%s%s%s%s%s%s%s$s$s');%,'delimiter','\t');
-        datestring = char(thisdata{4});
-        if length(char(thisdata{5}))~=8% all(char(thisdata{5}) == 'Yes') | all(char(thisdata{5}) == 'No')  % no hh:mm:ss, so columns are shifted
-            timestring = '00:00:00';
-            if ~isempty(str2num(char(thisdata{8})))
-                gageheight(counter) = str2num(char(thisdata{8}));
-            else
-                gageheight(counter) = NaN;
-            end
-            if ~isempty(str2num(char(thisdata{9})))
-                discharge(counter) = str2num(char(thisdata{9}));
-            else
-                discharge(counter) = NaN;
-            end
-        else
-            timestring = char(thisdata{5});
-            if ~isempty(str2num(char(thisdata{10})))
-                gageheight(counter) = str2num(char(thisdata{10}));
-            else
-                gageheight(counter) = NaN;
-            end
-            if ~isempty(str2num(char(thisdata{10})))
-                discharge(counter) = str2num(char(thisdata{11}));
-            else
-                discharge(counter) = NaN;
-            end
-        end
-        timestamp(counter) = datenum(str2num(datestring(1:4)), str2num(datestring(6:7)), str2num(datestring(9:10)), ...
-                str2num(timestring(1:2)), str2num(timestring(4:5)),str2num(timestring(7:8)) );
-    end
+disp([num2str(numel(q_resp.features)) ' discharge records, ' ...
+      num2str(numel(h_resp.features)) ' gage height records']);
+
+%% Extract fields into arrays
+
+n_q = numel(q_resp.features);
+q_ids = cell(n_q, 1);
+q_times = cell(n_q, 1);
+q_vals = NaN(n_q, 1);
+for i = 1:n_q
+    p = q_resp.features(i).properties;
+    q_ids{i} = p.field_visit_id;
+    q_times{i} = p.time;
+    q_vals(i) = str2double(p.value);
 end
 
-fclose(fid)
+n_h = numel(h_resp.features);
+h_times = cell(n_h, 1);
+h_vals = NaN(n_h, 1);
+for i = 1:n_h
+    p = h_resp.features(i).properties;
+    h_times{i} = p.time;
+    h_vals(i) = str2double(p.value);
+end
+
+%% Join on time so each row = one field visit
+
+[~, iq, ih] = intersect(q_times, h_times, 'stable');
+discharge = q_vals(iq); % ft^3/s
+gageheight = h_vals(ih); % ft
+
+% Parse ISO 8601 timestamps (e.g. '1985-09-25T07:00:00+00:00')
+
+time_strs = q_times(iq);
+timestamp = NaN(numel(iq), 1);
+for i = 1:numel(iq)
+    t = char(time_strs{i});
+    timestamp(i) = datenum(datetime(t(1:19), 'InputFormat', 'yyyy-MM-dd''T''HH:mm:ss'));
+end
+
+%% Sort by time (API returns records in arbitrary order)
+
+[timestamp, sort_idx] = sort(timestamp);
+discharge = discharge(sort_idx);
+gageheight = gageheight(sort_idx);
 
 %% Quality control
 
@@ -89,7 +102,7 @@ ylabel('Discharge (units?)')
 xlabel('Gage Height (units?)')
 cbar = colorbar; cb.Label.String = 'year';
 
-%% rating curve, latking the log of each side to enable a linear fit
+%% rating curve, taking the log of each side to enable a linear fit
 
 gooddata = find( gageheight>0 & discharge>0);
 offset = 0;
